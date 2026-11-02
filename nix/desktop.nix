@@ -36,7 +36,7 @@
   libxcb,
 }:
 let
-  version = "0.0.4";
+  version = "0.0.5";
 
   # The versioned directory is immutable; the flat copies in stable/desktop/
   # (and the www.nautili.dev/download/stable/* redirects) move with each release.
@@ -44,11 +44,11 @@ let
   sources = {
     x86_64-linux = {
       file = "nautili-desktop-linux-amd64.deb";
-      hash = "sha256-ToFQNssqqo9456q9ecDKldJbCz7ZKHrhza02zamBuP4=";
+      hash = "sha256-byYN9LFnbTX+PSYnUNOH/9eTD14HkL1QbyJx8gIAe7E=";
     };
     aarch64-darwin = {
       file = "nautili-desktop-mac-arm64.zip";
-      hash = "sha256-U2Z/nWHSt2psSp/qI2yROUIfQoNdW9lIyH0+f+vjp4o=";
+      hash = "sha256-8CuQHUaiBqtZFZcZ0Fm2Hx1urf+OQiuj2A4Y+svqIf8=";
     };
   };
 
