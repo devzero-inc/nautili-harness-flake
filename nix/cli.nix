@@ -8,7 +8,7 @@
   sysctl,
 }:
 let
-  version = "0.0.5";
+  version = "0.0.6";
 
   # `@nautili/tui` is only a Node shim that locates and execs a prebuilt
   # binary from one of the `@nautili/nt-<platform>-<arch>` packages, so we
@@ -18,11 +18,11 @@ let
   sources = {
     x86_64-linux = {
       npmName = "nt-linux-x64";
-      hash = "sha512-O+jnB0sA5V8ZRCSXfGM3kqr3++KVO6ayQb+4dFRWm4R1igBrfafbP8Er6LfjCJ+m41IKnVb2lcnvvOPWCpwZaA==";
+      hash = "sha512-Gyyc4F8ZZAEjw4ej4+hAZwE3ZgulrWPEKtitog7PjAJpq23vGikbMrcyn6duLPKHqLchJJhb47TqNmOf1l8/4w==";
     };
     aarch64-darwin = {
       npmName = "nt-darwin-arm64";
-      hash = "sha512-NyO0NeNI8YMDdrFrPkFDtZ7Y8RZRv0W4HROPDL8e5ugEKhfvU+6ua/bPn7mO06nVn7dUGqLCp0LdWZyQd37s9A==";
+      hash = "sha512-+Ny3qKhfZ+ateMvfKxfqYr5sSiFWYlKRjjZed48TTI7o14PSmqYQsncek2vtCtnSLWc1H5YmKvxaufkBBz8s6Q==";
     };
   };
 
