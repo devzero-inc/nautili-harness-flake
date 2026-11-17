@@ -81,10 +81,15 @@ jobs:
         # x86_64-linux and aarch64-darwin
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # This job runs the unreviewed `nt` it just downloaded, so it gets no
+    # write access and checkout keeps no token around.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.BRANCH }}
+          persist-credentials: false
 
       - uses: cachix/install-nix-action@v31
 
