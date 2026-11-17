@@ -1,11 +1,11 @@
 name: Update Nautili
 
-# Checks for new stable releases of the CLI (npm) and desktop app
+# Checks daily for new stable releases of the CLI (npm) and desktop app
 # (releases.nautili.ai). On a new version it commits the bump to the
 # auto-update/nautili branch, builds it on both systems, and opens a PR.
 on:
   schedule:
-    - cron: "23 * * * *"
+    - cron: "23 6 * * *"
   workflow_dispatch:
 
 permissions:
