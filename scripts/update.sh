@@ -2,6 +2,10 @@
 # Bump nix/cli.nix and nix/desktop.nix to the latest stable Nautili releases.
 #
 #   ./scripts/update.sh [cli] [desktop]     (both by default)
+#   ./scripts/update.sh cli|desktop --from FILE
+#
+# --from takes the version and hashes from FILE (another copy of that
+# package's nix file) instead of upstream, and changes nothing else.
 #
 #   cli:     version from npm's `latest` tag of @nautili/tui, hashes from each
 #            @nautili/nt-<platform> tarball's dist.integrity.
@@ -21,6 +25,12 @@
 set -euo pipefail
 
 self=$(realpath "$0")
+from=
+if (($# >= 2)) && [[ $2 == --from ]]; then
+  (($# == 3)) || { echo "usage: $0 cli|desktop --from FILE" >&2; exit 2; }
+  from=$(realpath "$3")
+  set -- "$1"
+fi
 cd "$(dirname "$self")/.."
 
 # Run each package in its own process, so one's failure can't stop the other.
@@ -64,17 +74,27 @@ case $package in
   *) echo "unknown package: $package (expected cli or desktop)" >&2; exit 2 ;;
 esac
 
+# stored_hash KEY NAME: the hash on the line after `KEY = "NAME";` in $from.
+stored_hash() {
+  local hash
+  hash=$(grep -A1 -x " *$1 = \"$2\";" "$from" | sed -n '2s/^ *hash = "\([^"]*\)";$/\1/p')
+  [[ $hash =~ ^sha(256|512)-[A-Za-z0-9+/]+=*$ ]] || { echo "no valid hash for $2 in $from" >&2; exit 1; }
+  echo "$hash"
+}
+
 old=$(current_version "$file")
-if [[ $package == cli ]]; then
-  new=$(fetch "$npm/@nautili%2ftui" | jq -er '."dist-tags".latest')
+if [[ -n $from ]]; then
+  new=$(current_version "$from") source=$from
+elif [[ $package == cli ]]; then
+  new=$(fetch "$npm/@nautili%2ftui" | jq -er '."dist-tags".latest') source="upstream's latest"
 else
-  new=$(fetch "$releases/latest.json" | jq -er .version)
+  new=$(fetch "$releases/latest.json" | jq -er .version) source="upstream's latest"
 fi
 
 # Only plain releases: a prerelease (0.0.8-rc.1) would sort after its final
 # release, and the version is also pasted into a sed program below.
 if [[ ! $new =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
-  echo "$name: upstream's latest is \"$new\", not a plain release version; leaving it" >&2
+  echo "$name: $source is \"$new\", not a plain release version; leaving it" >&2
   exit 1
 fi
 
@@ -83,17 +103,23 @@ if [[ $old == "$new" ]]; then
   exit 0
 fi
 if ! newer "$old" "$new"; then
-  echo "$name: upstream's latest is $new, older than the pinned $old; leaving it" >&2
+  echo "$name: $source is $new, older than the pinned $old; leaving it" >&2
   exit 0
 fi
-echo "$name: $old -> $new"
+echo "$name: $old -> $new${from:+ (from $from)}"
 
 # Edit a copy, so a failure halfway leaves the real file as it was.
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 cp "$file" "$tmp"
 
-if [[ $package == cli ]]; then
+if [[ -n $from ]]; then
+  key=$([[ $package == cli ]] && echo npmName || echo file)
+  for name_ in $(sed -n "s/^ *$key = \"\(.*\)\";$/\1/p" "$file"); do
+    hash=$(stored_hash "$key" "$name_")
+    set_hash "$tmp" "$key" "$name_" "$hash" "$file"
+  done
+elif [[ $package == cli ]]; then
   for npmName in $(sed -n 's/^ *npmName = "\(.*\)";$/\1/p' "$file"); do
     integrity=$(fetch "$npm/@nautili/$npmName/$new" | jq -er .dist.integrity) \
       || { echo "@nautili/$npmName@$new is not on npm (yet)" >&2; exit 1; }

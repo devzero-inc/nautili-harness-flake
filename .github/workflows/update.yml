@@ -60,7 +60,6 @@ jobs:
         run: |
           echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           version() { sed -n 's/^  version = "\(.*\)";$/\1/p'; }
-          newer() { [[ $1 != "$2" && $(printf '%s\n' "$1" "$2" | sort -V | tail -n1) == "$2" ]]; }
           bump() { grep -E '^ *(version|hash) = '; }
 
           # The branch from earlier runs, if any. ls-remote exits 2 when it is
@@ -75,14 +74,15 @@ jobs:
           echo "tip=$tip" >> "$GITHUB_OUTPUT"
 
           # A package whose upstream failed today keeps the bump the branch
-          # already offers, rather than this run withdrawing it.
-          for package in $FAILED; do
-            file=nix/$package.nix
-            if [[ -n $tip ]] && newer "$(version < "$file")" "$(git show "FETCH_HEAD:$file" | version)"; then
-              echo "$package: upstream failed; keeping the bump on $BRANCH"
-              git show "FETCH_HEAD:$file" > "$file"
-            fi
-          done
+          # already offers, rather than this run withdrawing it. Only its
+          # version and hashes come from the branch; the rest stays main's.
+          if [[ -n $tip ]]; then
+            for package in $FAILED; do
+              echo "$package: upstream failed; taking the version and hashes on $BRANCH, if newer"
+              git show "FETCH_HEAD:nix/$package.nix" > "$RUNNER_TEMP/$package.nix"
+              ./scripts/update.sh "$package" --from "$RUNNER_TEMP/$package.nix"
+            done
+          fi
 
           if git diff --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
