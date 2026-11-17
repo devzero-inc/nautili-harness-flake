@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # Bump nix/cli.nix and nix/desktop.nix to the latest stable Nautili releases.
 #
-#   CLI:     version from npm's `latest` tag of @nautili/tui, hashes from each
+#   ./scripts/update.sh [cli] [desktop]     (both by default)
+#
+#   cli:     version from npm's `latest` tag of @nautili/tui, hashes from each
 #            @nautili/nt-<platform> tarball's dist.integrity.
-#   Desktop: version from https://releases.nautili.ai/stable/latest.json,
+#   desktop: version from https://releases.nautili.ai/stable/latest.json,
 #            hashes from that version's SHA256SUMS.
+#
+# Each package is updated on its own: if one fails (say a platform tarball is
+# not on npm yet), the other is still updated and the script exits 1 at the
+# end. A failed package's file is left untouched. A version older than the
+# pinned one is reported and skipped, never written.
 #
 # The systems to update are read from the nix files themselves (each
 # `npmName = ...` / `file = ...` line and the `hash = ...` line after it), so
@@ -14,8 +21,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cli=nix/cli.nix
-desktop=nix/desktop.nix
+# Run each package in its own process, so one's failure can't stop the other.
+if (($# != 1)); then
+  (($#)) || set -- cli desktop
+  rc=0
+  for package; do
+    "$0" "$package" || rc=1
+  done
+  exit "$rc"
+fi
+
 npm=https://registry.npmjs.org
 releases=https://releases.nautili.ai/stable
 
@@ -25,46 +40,66 @@ current_version() { sed -n 's/^  version = "\(.*\)";$/\1/p' "$1"; }
 
 set_version() {
   sed -i "s/^  version = \".*\";$/  version = \"$2\";/" "$1"
-  [[ $(current_version "$1") == "$2" ]] || { echo "could not set the version in $1" >&2; exit 1; }
+  [[ $(current_version "$1") == "$2" ]] || { echo "could not set the version in $3" >&2; exit 1; }
 }
 
 # set_hash FILE KEY NAME HASH: set the hash on the line after `KEY = "NAME";`.
 set_hash() {
   sed -i "/^ *$2 = \"$3\";$/{n;s|^\( *hash = \"\).*\";$|\1$4\";|}" "$1"
-  grep -A1 "^ *$2 = \"$3\";$" "$1" | grep -qF "hash = \"$4\";" \
-    || { echo "could not set the hash for $3 in $1" >&2; exit 1; }
+  [[ $(grep -A1 -x " *$2 = \"$3\";" "$1" | sed -n '2s/^ *//p') == "hash = \"$4\";" ]] \
+    || { echo "could not set the hash for $3 in $5" >&2; exit 1; }
 }
 
 hex_to_sri() { echo "sha256-$(xxd -r -p <<<"$1" | base64 -w0)"; }
 
-# --- CLI ---------------------------------------------------------------------
-old=$(current_version "$cli")
-new=$(fetch "$npm/@nautili%2ftui" | jq -er '."dist-tags".latest')
-if [[ $old == "$new" ]]; then
-  echo "nautili: $old is current"
+# newer OLD NEW: is NEW a later version than OLD?
+newer() { [[ $1 != "$2" && $(printf '%s\n' "$1" "$2" | sort -V | tail -n1) == "$2" ]]; }
+
+package=$1
+case $package in
+  cli) file=nix/cli.nix name=nautili ;;
+  desktop) file=nix/desktop.nix name=nautili-desktop ;;
+  *) echo "unknown package: $package (expected cli or desktop)" >&2; exit 2 ;;
+esac
+
+old=$(current_version "$file")
+if [[ $package == cli ]]; then
+  new=$(fetch "$npm/@nautili%2ftui" | jq -er '."dist-tags".latest')
 else
-  echo "nautili: $old -> $new"
-  for name in $(sed -n 's/^ *npmName = "\(.*\)";$/\1/p' "$cli"); do
-    integrity=$(fetch "$npm/@nautili/$name/$new" | jq -er .dist.integrity) \
-      || { echo "@nautili/$name@$new is not on npm (yet)" >&2; exit 1; }
-    set_hash "$cli" npmName "$name" "$integrity"
-  done
-  set_version "$cli" "$new"
+  new=$(fetch "$releases/latest.json" | jq -er .version)
 fi
 
-# --- Desktop -----------------------------------------------------------------
-old=$(current_version "$desktop")
-new=$(fetch "$releases/latest.json" | jq -er .version)
 if [[ $old == "$new" ]]; then
-  echo "nautili-desktop: $old is current"
-else
-  echo "nautili-desktop: $old -> $new"
-  sums=$(fetch "$releases/desktop/$new/SHA256SUMS")
-  for file in $(sed -n 's/^ *file = "\(.*\)";$/\1/p' "$desktop"); do
-    hex=$(awk -v f="$file" '$2 == f { print $1 }' <<<"$sums")
-    [[ $hex =~ ^[0-9a-f]{64}$ ]] \
-      || { echo "$file is not in $releases/desktop/$new/SHA256SUMS" >&2; exit 1; }
-    set_hash "$desktop" file "$file" "$(hex_to_sri "$hex")"
-  done
-  set_version "$desktop" "$new"
+  echo "$name: $old is current"
+  exit 0
 fi
+if ! newer "$old" "$new"; then
+  echo "$name: upstream's latest is $new, older than the pinned $old; leaving it" >&2
+  exit 0
+fi
+echo "$name: $old -> $new"
+
+# Edit a copy, so a failure halfway leaves the real file as it was.
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+cp "$file" "$tmp"
+
+if [[ $package == cli ]]; then
+  for npmName in $(sed -n 's/^ *npmName = "\(.*\)";$/\1/p' "$file"); do
+    integrity=$(fetch "$npm/@nautili/$npmName/$new" | jq -er .dist.integrity) \
+      || { echo "@nautili/$npmName@$new is not on npm (yet)" >&2; exit 1; }
+    set_hash "$tmp" npmName "$npmName" "$integrity" "$file"
+  done
+else
+  sums=$(fetch "$releases/desktop/$new/SHA256SUMS") \
+    || { echo "$releases/desktop/$new/SHA256SUMS is not published (yet)" >&2; exit 1; }
+  for asset in $(sed -n 's/^ *file = "\(.*\)";$/\1/p' "$file"); do
+    hex=$(awk -v f="$asset" '$2 == f { print $1 }' <<<"$sums")
+    [[ $hex =~ ^[0-9a-f]{64}$ ]] \
+      || { echo "$asset is not (exactly once) in $releases/desktop/$new/SHA256SUMS" >&2; exit 1; }
+    set_hash "$tmp" file "$asset" "$(hex_to_sri "$hex")" "$file"
+  done
+fi
+set_version "$tmp" "$new" "$file"
+
+cp "$tmp" "$file"

@@ -1,16 +1,20 @@
 name: Update Nautili
 
 # Checks daily for new stable releases of the CLI (npm) and desktop app
-# (releases.nautili.ai). On a new version it commits the bump to the
-# auto-update/nautili branch, builds it on both systems, and opens a PR.
+# (releases.nautili.ai). A new version is built on both systems, and only once
+# both builds pass is it pushed to the auto-update/nautili branch with a PR.
+#
+# The branch therefore only ever holds a bump that built. A run whose bump is
+# already on the branch does nothing, whether its PR is open, merged or was
+# closed: closing the PR declines that version, and the next release gets a new
+# PR. Delete the branch to have a declined version offered again.
 on:
   schedule:
     - cron: "23 6 * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: update-nautili
@@ -22,18 +26,32 @@ jobs:
   update:
     runs-on: ubuntu-latest
     outputs:
-      changed: ${{ steps.commit.outputs.changed }}
-      title: ${{ steps.commit.outputs.title }}
+      base: ${{ steps.check.outputs.base }}
+      changed: ${{ steps.check.outputs.changed }}
+      title: ${{ steps.check.outputs.title }}
+      upstream-failed: ${{ steps.update.outputs.failed }}
     steps:
+      # Always main, even for a manual run started from another branch.
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
-      - run: ./scripts/update.sh
+      # A failure for one package still lets the other's bump through; the
+      # upstream job below then fails the run so it gets noticed.
+      - id: update
+        run: ./scripts/update.sh || echo "failed=true" >> "$GITHUB_OUTPUT"
 
-      - id: commit
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - id: check
         run: |
+          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git fetch -q --depth=1 origin "$BRANCH" 2>/dev/null \
+            && git diff --quiet FETCH_HEAD -- nix/cli.nix nix/desktop.nix; then
+            echo "$BRANCH already has this bump; nothing to do"
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -50,27 +68,16 @@ jobs:
           else
             title="Update nautili to $cli and nautili-desktop to $desktop"
           fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          git commit -am "$title"
-
-          # Skip a bump only once a PR is open for it. If an earlier run pushed
-          # the branch but its build or PR step failed, retry those.
-          if git fetch -q origin "$BRANCH" && git diff --quiet FETCH_HEAD HEAD; then
-            pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
-            if [[ -n $pr ]]; then
-              echo "#$pr already has this update"
-              echo "changed=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "$BRANCH already has this update but no open PR; retrying the build"
-          else
-            git push --force origin "HEAD:refs/heads/$BRANCH"
-          fi
-
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "title=$title" >> "$GITHUB_OUTPUT"
+
+      - if: steps.check.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bump
+          path: |
+            nix/cli.nix
+            nix/desktop.nix
 
   build:
     needs: update
@@ -81,15 +88,18 @@ jobs:
         # x86_64-linux and aarch64-darwin
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # This job runs the unreviewed `nt` it just downloaded, so it gets no
-    # write access and checkout keeps no token around.
-    permissions:
-      contents: read
+    # This job runs the unreviewed `nt` it just downloaded, so it keeps the
+    # workflow's read-only token and checkout doesn't store even that.
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.BRANCH }}
+          ref: ${{ needs.update.outputs.base }}
           persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bump
+          path: nix
 
       - uses: cachix/install-nix-action@v31
 
@@ -100,17 +110,45 @@ jobs:
   pr:
     needs: [update, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.update.outputs.base }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bump
+          path: nix
+
       - env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           TITLE: ${{ needs.update.outputs.title }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git commit -am "$TITLE"
+          git push --force origin "HEAD:refs/heads/$BRANCH"
+
           body="Built on x86_64-linux and aarch64-darwin in $RUN_URL."
           number=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
           if [[ -n $number ]]; then
             gh pr edit "$number" --title "$TITLE" --body "$body"
-          else
-            gh pr create --base main --head "$BRANCH" --title "$TITLE" --body "$body"
+          elif ! gh pr create --base main --head "$BRANCH" --title "$TITLE" --body "$body"; then
+            # Without a PR the next run would see the bump on the branch and
+            # skip it, so take the branch away again to have it retried.
+            git push origin --delete "$BRANCH"
+            exit 1
           fi
+
+  upstream:
+    needs: update
+    if: needs.update.outputs.upstream-failed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "::error::scripts/update.sh could not update every package; see the update job's log"
+          exit 1
