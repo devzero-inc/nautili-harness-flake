@@ -11,7 +11,8 @@
 # Each package is updated on its own: if one fails (say a platform tarball is
 # not on npm yet), the other is still updated and the script exits 1 at the
 # end. A failed package's file is left untouched. A version older than the
-# pinned one is reported and skipped, never written.
+# pinned one is reported and skipped, never written; one that isn't a plain
+# release (a prerelease, or anything else) is reported as a failure.
 #
 # The systems to update are read from the nix files themselves (each
 # `npmName = ...` / `file = ...` line and the `hash = ...` line after it), so
@@ -19,14 +20,15 @@
 # xxd and base64.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+self=$(realpath "$0")
+cd "$(dirname "$self")/.."
 
 # Run each package in its own process, so one's failure can't stop the other.
 if (($# != 1)); then
   (($#)) || set -- cli desktop
   rc=0
   for package; do
-    "$0" "$package" || rc=1
+    "$self" "$package" || rc=1
   done
   exit "$rc"
 fi
@@ -67,6 +69,13 @@ if [[ $package == cli ]]; then
   new=$(fetch "$npm/@nautili%2ftui" | jq -er '."dist-tags".latest')
 else
   new=$(fetch "$releases/latest.json" | jq -er .version)
+fi
+
+# Only plain releases: a prerelease (0.0.8-rc.1) would sort after its final
+# release, and the version is also pasted into a sed program below.
+if [[ ! $new =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+  echo "$name: upstream's latest is \"$new\", not a plain release version; leaving it" >&2
+  exit 1
 fi
 
 if [[ $old == "$new" ]]; then

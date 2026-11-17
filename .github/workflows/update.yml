@@ -4,10 +4,12 @@ name: Update Nautili
 # (releases.nautili.ai). A new version is built on both systems, and only once
 # both builds pass is it pushed to the auto-update/nautili branch with a PR.
 #
-# The branch therefore only ever holds a bump that built. A run whose bump is
-# already on the branch does nothing, whether its PR is open, merged or was
-# closed: closing the PR declines that version, and the next release gets a new
-# PR. Delete the branch to have a declined version offered again.
+# A run does nothing when the branch already holds this bump and a PR from
+# this repo has the branch tip as its head and this bump's title, whether that
+# PR is open, merged or closed: closing the PR declines that version, and the
+# next release gets a new PR. Delete the branch to have a declined version
+# offered again. If a run dies partway (no PR, or a stale one), the next run
+# redoes it.
 on:
   schedule:
     - cron: "23 6 * * *"
@@ -21,12 +23,17 @@ concurrency:
 
 env:
   BRANCH: auto-update/nautili
+  BOT_EMAIL: 41898283+github-actions[bot]@users.noreply.github.com
 
 jobs:
   update:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       base: ${{ steps.check.outputs.base }}
+      tip: ${{ steps.check.outputs.tip }}
       changed: ${{ steps.check.outputs.changed }}
       title: ${{ steps.check.outputs.title }}
       upstream-failed: ${{ steps.update.outputs.failed }}
@@ -39,26 +46,51 @@ jobs:
       # A failure for one package still lets the other's bump through; the
       # upstream job below then fails the run so it gets noticed.
       - id: update
-        run: ./scripts/update.sh || echo "failed=true" >> "$GITHUB_OUTPUT"
+        run: |
+          failed=
+          for package in cli desktop; do
+            ./scripts/update.sh "$package" || failed+="$package "
+          done
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
 
       - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAILED: ${{ steps.update.outputs.failed }}
         run: |
           echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          version() { sed -n 's/^  version = "\(.*\)";$/\1/p'; }
+          newer() { [[ $1 != "$2" && $(printf '%s\n' "$1" "$2" | sort -V | tail -n1) == "$2" ]]; }
+          bump() { grep -E '^ *(version|hash) = '; }
+
+          # The branch from earlier runs, if any. ls-remote exits 2 when it is
+          # absent; anything else is a real error, so fail rather than guess.
+          tip=
+          if git ls-remote --exit-code origin "refs/heads/$BRANCH" > /dev/null; then
+            git fetch -q --depth=1 origin "refs/heads/$BRANCH"
+            tip=$(git rev-parse FETCH_HEAD)
+          elif (($? != 2)); then
+            exit 1
+          fi
+          echo "tip=$tip" >> "$GITHUB_OUTPUT"
+
+          # A package whose upstream failed today keeps the bump the branch
+          # already offers, rather than this run withdrawing it.
+          for package in $FAILED; do
+            file=nix/$package.nix
+            if [[ -n $tip ]] && newer "$(version < "$file")" "$(git show "FETCH_HEAD:$file" | version)"; then
+              echo "$package: upstream failed; keeping the bump on $BRANCH"
+              git show "FETCH_HEAD:$file" > "$file"
+            fi
+          done
+
           if git diff --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if git fetch -q --depth=1 origin "$BRANCH" 2>/dev/null \
-            && git diff --quiet FETCH_HEAD -- nix/cli.nix nix/desktop.nix; then
-            echo "$BRANCH already has this bump; nothing to do"
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          version() { sed -n 's/^  version = "\(.*\)";$/\1/p' "$1"; }
-          cli=$(version nix/cli.nix)
-          desktop=$(version nix/desktop.nix)
+          cli=$(version < nix/cli.nix)
+          desktop=$(version < nix/desktop.nix)
           if git diff --quiet nix/desktop.nix; then
             title="Update nautili to $cli"
           elif git diff --quiet nix/cli.nix; then
@@ -68,8 +100,36 @@ jobs:
           else
             title="Update nautili to $cli and nautili-desktop to $desktop"
           fi
-          echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "title=$title" >> "$GITHUB_OUTPUT"
+
+          if [[ -n $tip ]]; then
+            # PRs from this repo only: --head matches fork branches of the
+            # same name too.
+            prs=$(gh pr list --head "$BRANCH" --state all --limit 100 \
+              --json number,state,headRefOid,title,isCrossRepository \
+              --jq 'map(select(.isCrossRepository | not))')
+
+            # Same versions and hashes as the branch (other lines may differ,
+            # e.g. main edited a comment), and a PR for exactly that.
+            if cmp -s <(cat nix/cli.nix nix/desktop.nix | bump) \
+                      <(git show FETCH_HEAD:nix/cli.nix FETCH_HEAD:nix/desktop.nix | bump) \
+              && jq -e --arg tip "$tip" --arg title "$title" \
+                'any(.[]; .headRefOid == $tip and .title == $title)' <<<"$prs" > /dev/null; then
+              echo "$BRANCH already has this bump and its PR; nothing to do"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # Someone pushed to the open PR's branch: leave their work alone.
+            if [[ $(git log -1 --format=%ae FETCH_HEAD) != "$BOT_EMAIL" ]] \
+              && jq -e 'any(.[]; .state == "OPEN")' <<<"$prs" > /dev/null; then
+              echo "::warning::$BRANCH has commits that aren't the bot's on an open PR; not replacing them with \"$title\""
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - if: steps.check.outputs.changed == 'true'
         uses: actions/upload-artifact@v4
@@ -123,35 +183,35 @@ jobs:
           name: bump
           path: nix
 
+      # If anything here fails, the next run finds no PR matching the branch
+      # and redoes it.
       - env:
           GH_TOKEN: ${{ github.token }}
           TITLE: ${{ needs.update.outputs.title }}
+          TIP: ${{ needs.update.outputs.tip }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # Look the PR up before pushing: if this fails, the branch is still
-          # unchanged and the next run retries.
-          number=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
-
           git config user.name "github-actions[bot]"
-          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git config user.email "$BOT_EMAIL"
           git commit -am "$TITLE"
-          git push --force origin "HEAD:refs/heads/$BRANCH"
+          # Only replace the branch the update job looked at (or create it if
+          # there was none), never a push that landed since.
+          git push --force-with-lease="refs/heads/$BRANCH:$TIP" origin "HEAD:refs/heads/$BRANCH"
 
           body="Built on x86_64-linux and aarch64-darwin in $RUN_URL."
+          number=$(gh pr list --head "$BRANCH" --state open --json number,isCrossRepository \
+            --jq 'map(select(.isCrossRepository | not))[0].number // empty')
           if [[ -n $number ]]; then
             gh pr edit "$number" --title "$TITLE" --body "$body"
-          elif ! gh pr create --base main --head "$BRANCH" --title "$TITLE" --body "$body"; then
-            # Without a PR the next run would see the bump on the branch and
-            # skip it, so take the branch away again to have it retried.
-            git push origin --delete "$BRANCH"
-            exit 1
+          else
+            gh pr create --base main --head "$BRANCH" --title "$TITLE" --body "$body"
           fi
 
   upstream:
     needs: update
-    if: needs.update.outputs.upstream-failed == 'true'
+    if: needs.update.outputs.upstream-failed != ''
     runs-on: ubuntu-latest
     steps:
       - run: |
-          echo "::error::scripts/update.sh could not update every package; see the update job's log"
+          echo "::error::scripts/update.sh failed for: ${{ needs.update.outputs.upstream-failed }}; see the update job's log"
           exit 1
