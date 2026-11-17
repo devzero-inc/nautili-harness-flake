@@ -128,13 +128,16 @@ jobs:
           TITLE: ${{ needs.update.outputs.title }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          # Look the PR up before pushing: if this fails, the branch is still
+          # unchanged and the next run retries.
+          number=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
+
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
           git commit -am "$TITLE"
           git push --force origin "HEAD:refs/heads/$BRANCH"
 
           body="Built on x86_64-linux and aarch64-darwin in $RUN_URL."
-          number=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
           if [[ -n $number ]]; then
             gh pr edit "$number" --title "$TITLE" --body "$body"
           elif ! gh pr create --base main --head "$BRANCH" --title "$TITLE" --body "$body"; then
