@@ -1,0 +1,103 @@
+name: Update Nautili
+
+# Checks for new stable releases of the CLI (npm) and desktop app
+# (releases.nautili.ai). On a new version it commits the bump to the
+# auto-update/nautili branch, builds it on both systems, and opens a PR.
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-nautili
+
+env:
+  BRANCH: auto-update/nautili
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.commit.outputs.changed }}
+      title: ${{ steps.commit.outputs.title }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: ./scripts/update.sh
+
+      - id: commit
+        run: |
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          version() { sed -n 's/^  version = "\(.*\)";$/\1/p' "$1"; }
+          cli=$(version nix/cli.nix)
+          desktop=$(version nix/desktop.nix)
+          if git diff --quiet nix/desktop.nix; then
+            title="Update nautili to $cli"
+          elif git diff --quiet nix/cli.nix; then
+            title="Update nautili-desktop to $desktop"
+          elif [[ $cli == "$desktop" ]]; then
+            title="Update nautili and nautili-desktop to $cli"
+          else
+            title="Update nautili to $cli and nautili-desktop to $desktop"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git commit -am "$title"
+
+          # Don't rebuild a bump that is already on the branch.
+          if git fetch -q origin "$BRANCH" && git diff --quiet FETCH_HEAD HEAD; then
+            echo "$BRANCH already has this update"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git push --force origin "HEAD:refs/heads/$BRANCH"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: update
+    if: needs.update.outputs.changed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86_64-linux and aarch64-darwin
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+
+      - uses: cachix/install-nix-action@v31
+
+      - run: nix build --print-build-logs .#nautili .#nautili-desktop
+
+      - run: ./result/bin/nt --version
+
+  pr:
+    needs: [update, build]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: ${{ needs.update.outputs.title }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body="Built on x86_64-linux and aarch64-darwin in $RUN_URL."
+          number=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
+          if [[ -n $number ]]; then
+            gh pr edit "$number" --title "$TITLE" --body "$body"
+          else
+            gh pr create --base main --head "$BRANCH" --title "$TITLE" --body "$body"
+          fi
